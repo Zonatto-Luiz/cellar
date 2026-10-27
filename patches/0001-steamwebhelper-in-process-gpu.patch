@@ -1,0 +1,35 @@
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -566,7 +566,32 @@
+             return FALSE;
+         }
+     }
++
++    /* cellar hack: Chromium's GPU process draws into windows owned by the browser process, and
++     * winemac.drv can't present drawing from another process, so Steam's UI stays black.
++     * Keep the GPU work inside steamwebhelper's browser process instead. */
++    {
++        static const WCHAR helperW[] = L"steamwebhelper.exe";
++        static const WCHAR flagW[] = L" --in-process-gpu";
++        size_t name_len = wcslen( app_name ), helper_len = wcslen( helperW );
+ 
++        if (name_len >= helper_len && !wcsicmp( app_name + name_len - helper_len, helperW )
++            && !wcsstr( tidy_cmdline, L"--type=" ) && !wcsstr( tidy_cmdline, L"--in-process-gpu" ))
++        {
++            size_t len = wcslen( tidy_cmdline ) + wcslen( flagW ) + 1;
++            WCHAR *new_cmdline = HeapAlloc( GetProcessHeap(), 0, len * sizeof(WCHAR) );
++
++            if (new_cmdline)
++            {
++                FIXME( "HACK: adding --in-process-gpu to steamwebhelper.exe\n" );
++                wcscpy( new_cmdline, tidy_cmdline );
++                wcscat( new_cmdline, flagW );
++                if (tidy_cmdline != cmd_line) HeapFree( GetProcessHeap(), 0, tidy_cmdline );
++                tidy_cmdline = new_cmdline;
++            }
++        }
++    }
++
+     /* Warn if unsupported features are used */
+ 
+     if (flags & (IDLE_PRIORITY_CLASS | HIGH_PRIORITY_CLASS | REALTIME_PRIORITY_CLASS |

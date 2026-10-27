@@ -1,0 +1,356 @@
+#!/bin/bash
+# cellar — a small Wine manager for running Windows Steam and games on macOS.
+# Bash 3.2 compatible (macOS /bin/bash).
+set -euo pipefail
+
+CELLAR_HOME="${CELLAR_HOME:-$HOME/Library/Application Support/Cellar}"
+RUNTIMES="$CELLAR_HOME/runtimes"
+BOTTLES="$CELLAR_HOME/bottles"
+CACHE="$CELLAR_HOME/cache"
+# cx = Wine built by build-wine.sh from CodeWeavers' source; the only runtime where Steam's UI works.
+DEFAULT_RUNTIME="${CELLAR_DEFAULT_RUNTIME:-cx}"
+STEAM_SETUP_URL="https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe"
+# Steam for Windows ignores -cef-* flags; the black-UI fix lives in patches/ instead.
+STEAM_ARGS="${CELLAR_STEAM_ARGS:-}"
+
+die() { echo "cellar: $*" >&2; exit 1; }
+log() { echo "==> $*"; }
+
+usage() {
+  cat <<EOF
+Usage: cellar <command> [args]
+
+  doctor                          Check this Mac is ready (Rosetta, GStreamer, runtimes)
+  status                          Bottles with runtime and running/stopped state (tab-separated)
+  runtime list                    Show installed runtimes
+  runtime install <name> [tag]    Download a runtime: staging | devel | gptk
+  runtime link <name> <dir>       Use an existing Wine install (dir containing bin/wine)
+  runtime d3dmetal <name> on|off  Use Apple's D3DMetal for DirectX 10/11/12 in a runtime
+  bottle list                     Show bottles
+  bottle create <bottle> [runtime]  Create a Wine prefix (default runtime: $DEFAULT_RUNTIME)
+  bottle delete <bottle>          Delete a bottle and everything installed in it
+  steam install <bottle>          Download and silently install Windows Steam
+  steam run <bottle> [--fg] [--hud] [args]  Launch Steam (logs to <bottle>/logs/steam.log)
+  run <bottle> <program> [args]   Run a Windows program (.exe path or e.g. winecfg)
+  kill <bottle>                   Stop every Windows process in the bottle
+  open <bottle>                   Open the bottle's C: drive in Finder
+
+Data lives in: $CELLAR_HOME
+EOF
+}
+
+# --- runtimes ---------------------------------------------------------------
+
+runtime_source() { # name -> "repo asset-prefix"
+  case "$1" in
+    staging) echo "Gcenx/macOS_Wine_builds wine-staging-" ;;
+    devel)   echo "Gcenx/macOS_Wine_builds wine-devel-" ;;
+    gptk)    echo "Gcenx/game-porting-toolkit game-porting-toolkit-" ;;
+    *) die "unknown runtime '$1' (expected staging, devel or gptk)" ;;
+  esac
+}
+
+wine_bin() { # runtime -> path to the wine loader
+  local dir="$RUNTIMES/$1" bin
+  [ -d "$dir" ] || die "runtime '$1' is not installed; run: cellar runtime install $1"
+  # Older bases (GPTK) ship wine64 as the 64-bit loader; Wine 11 wow64 builds only ship wine.
+  bin=$(find -L "$dir" -path '*/bin/wine64' \( -type f -o -type l \) 2>/dev/null | head -1)
+  [ -n "$bin" ] || bin=$(find -L "$dir" -path '*/bin/wine' \( -type f -o -type l \) 2>/dev/null | head -1)
+  [ -n "$bin" ] || die "no wine binary found in $dir"
+  echo "$bin"
+}
+
+runtime_install() {
+  local name="${1:-}" tag="${2:-}" src repo prefix api meta asset url digest file tmp
+  [ -n "$name" ] || die "usage: cellar runtime install <staging|devel|gptk> [tag]"
+  src=$(runtime_source "$name"); repo=${src% *}; prefix=${src#* }
+  if [ -n "$tag" ]; then api="https://api.github.com/repos/$repo/releases/tags/$tag"
+  else api="https://api.github.com/repos/$repo/releases/latest"; fi
+
+  log "Looking up $name release from $repo"
+  meta=$(curl -fsSL "$api" | /usr/bin/python3 -I -c '
+import sys, json
+r = json.load(sys.stdin); p = sys.argv[1]
+for a in r["assets"]:
+    if a["name"].startswith(p) and a["name"].endswith((".tar.xz", ".tar.gz")):
+        print(r["tag_name"], a["name"], a["browser_download_url"], (a.get("digest") or "").replace("sha256:", ""))
+        break
+' "$prefix") || die "could not query GitHub releases"
+  [ -n "$meta" ] || die "no matching asset in $repo"
+  set -- $meta; tag=$1; asset=$2; url=$3; digest=${4:-}
+
+  mkdir -p "$CACHE" "$RUNTIMES"
+  file="$CACHE/$asset"
+  if [ ! -f "$file" ]; then
+    log "Downloading $asset"
+    curl -fL --progress-bar -o "$file.part" "$url"
+    mv "$file.part" "$file"
+  fi
+  if [ -n "$digest" ]; then
+    log "Verifying sha256"
+    echo "$digest  $file" | shasum -a 256 -c - >/dev/null || { rm -f "$file"; die "checksum mismatch for $asset"; }
+  fi
+
+  log "Extracting to $RUNTIMES/$name"
+  tmp="$RUNTIMES/.$name.tmp"
+  rm -rf "$tmp"; mkdir -p "$tmp"
+  tar -xf "$file" -C "$tmp"
+  xattr -dr com.apple.quarantine "$tmp" 2>/dev/null || true
+  rm -rf "$RUNTIMES/$name"; mv "$tmp" "$RUNTIMES/$name"
+  echo "$tag" > "$RUNTIMES/$name/VERSION"
+  log "Installed $name $tag ($("$(wine_bin "$name")" --version 2>/dev/null || echo '?'))"
+}
+
+runtime_link() { # use an existing Wine install (e.g. Whisky's Wine) as a runtime
+  local name="${1:-}" src="${2:-}"
+  [ -n "$name" ] && [ -n "$src" ] || die "usage: cellar runtime link <name> <wine-dir containing bin/wine>"
+  case "$name" in */*|.*) die "invalid runtime name '$name'" ;; esac
+  [ -x "$src/bin/wine" ] || [ -x "$src/bin/wine64" ] || die "no bin/wine in $src"
+  mkdir -p "$RUNTIMES/$name"
+  ln -sfn "$src" "$RUNTIMES/$name/wine"
+  echo "linked:$src" > "$RUNTIMES/$name/VERSION"
+  log "Linked $name -> $src ($("$(wine_bin "$name")" --version 2>/dev/null || echo '?'))"
+}
+
+# Apple's D3DMetal (DX10/11/12 -> Metal) from the gptk runtime, dropped into another runtime.
+# CodeWeavers' Wine source has the hooks for it; wined3d over macOS OpenGL tops out at D3D feature level 10.1.
+D3DMETAL_DLLS="d3d10 d3d11 d3d12 dxgi"
+
+runtime_d3dmetal() {
+  local rt="${1:-}" mode="${2:-}" lib src backup d
+  [ -n "$rt" ] && [ -n "$mode" ] || die "usage: cellar runtime d3dmetal <runtime> on|off"
+  lib="$(dirname "$(wine_bin "$rt")")/../lib"
+  backup="$lib/wine/.wined3d-backup"
+  case "$mode" in
+    on)
+      [ -d "$RUNTIMES/gptk" ] || runtime_install gptk
+      src="$(dirname "$(wine_bin gptk)")/../lib"
+      [ -d "$src/external/D3DMetal.framework" ] || die "D3DMetal not found in gptk runtime"
+      if [ ! -d "$backup" ]; then
+        mkdir -p "$backup/x86_64-windows" "$backup/x86_64-unix"
+        for d in $D3DMETAL_DLLS; do
+          cp -a "$lib/wine/x86_64-windows/$d.dll" "$backup/x86_64-windows/"
+          [ -f "$lib/wine/x86_64-unix/$d.so" ] && cp -a "$lib/wine/x86_64-unix/$d.so" "$backup/x86_64-unix/"
+        done
+      fi
+      rm -rf "$lib/external"; cp -a "$src/external" "$lib/external"
+      for d in $D3DMETAL_DLLS; do
+        cp -f "$src/wine/x86_64-windows/$d.dll" "$lib/wine/x86_64-windows/"
+        # GPTK ships these as symlinks to ../../external/libd3dshared.dylib; copying the
+        # target instead gives each DLL its own copy of D3DMetal's state and it crashes.
+        rm -f "$lib/wine/x86_64-unix/$d.so"
+        cp -P "$src/wine/x86_64-unix/$d.so" "$lib/wine/x86_64-unix/"
+      done
+      log "D3DMetal enabled in runtime '$rt'"
+      ;;
+    off)
+      [ -d "$backup" ] || die "D3DMetal is not enabled in runtime '$rt'"
+      for d in $D3DMETAL_DLLS; do
+        cp -f "$backup/x86_64-windows/$d.dll" "$lib/wine/x86_64-windows/"
+        rm -f "$lib/wine/x86_64-unix/$d.so"
+        [ -f "$backup/x86_64-unix/$d.so" ] && cp -f "$backup/x86_64-unix/$d.so" "$lib/wine/x86_64-unix/"
+      done
+      rm -rf "$lib/external" "$backup"
+      log "D3DMetal disabled in runtime '$rt' (back to wined3d)"
+      ;;
+    *) die "usage: cellar runtime d3dmetal <runtime> on|off" ;;
+  esac
+}
+
+runtime_list() {
+  local d
+  for d in "$RUNTIMES"/*/; do
+    [ -d "$d" ] || { echo "(none)"; return; }
+    printf '%-10s %s\n' "$(basename "$d")" "$(cat "$d/VERSION" 2>/dev/null || echo '?')"
+  done
+}
+
+# --- bottles ----------------------------------------------------------------
+
+bottle_dir() {
+  local b="${1:-}"
+  [ -n "$b" ] || die "missing bottle name"
+  case "$b" in */*|.*) die "invalid bottle name '$b'" ;; esac
+  echo "$BOTTLES/$b"
+}
+
+bottle_runtime() {
+  local conf; conf="$(bottle_dir "$1")/cellar.conf"
+  [ -f "$conf" ] || die "bottle '$1' does not exist; run: cellar bottle create $1"
+  sed -n 's/^RUNTIME=//p' "$conf"
+}
+
+# Run wine inside a bottle with cellar's standard environment.
+bwine() {
+  local b="$1"; shift
+  local dir rt bin
+  dir=$(bottle_dir "$b"); rt=$(bottle_runtime "$b"); bin=$(wine_bin "$rt")
+  env WINEPREFIX="$dir" \
+      WINEDEBUG="${WINEDEBUG:--all}" \
+      WINEMSYNC="${WINEMSYNC:-1}" \
+      WINEESYNC="${WINEESYNC:-1}" \
+      ROSETTA_ADVERTISE_AVX="${ROSETTA_ADVERTISE_AVX:-1}" \
+      PATH="$(dirname "$bin"):$PATH" \
+      DYLD_FALLBACK_LIBRARY_PATH="$(dirname "$bin")/../lib:$(dirname "$bin")/../lib/external:/usr/lib" \
+      DYLD_FALLBACK_FRAMEWORK_PATH="$(dirname "$bin")/../lib/external" \
+      "$bin" "$@"
+}
+
+bwineserver() {
+  local b="$1"; shift
+  local bin; bin=$(wine_bin "$(bottle_runtime "$b")")
+  WINEPREFIX="$(bottle_dir "$b")" "$(dirname "$bin")/wineserver" "$@"
+}
+
+bottle_create() {
+  local b="${1:-}" rt="${2:-$DEFAULT_RUNTIME}" dir
+  dir=$(bottle_dir "$b")
+  [ ! -e "$dir" ] || die "bottle '$b' already exists"
+  [ -d "$RUNTIMES/$rt" ] || runtime_install "$rt"
+
+  mkdir -p "$dir/logs"
+  echo "RUNTIME=$rt" > "$dir/cellar.conf"
+  log "Initialising bottle '$b' with runtime $rt"
+  bwine "$b" wineboot --init >"$dir/logs/wineboot.log" 2>&1 || die "wineboot failed; see $dir/logs/wineboot.log"
+  bwine "$b" winecfg -v win10 >>"$dir/logs/wineboot.log" 2>&1 || true
+  # Cmd mapped like a Mac app. RetinaMode stays off (Wine's default): with it on, Steam's UI renders at half size.
+  bwine "$b" reg add 'HKCU\Software\Wine\Mac Driver' /v LeftCommandIsCtrl /t REG_SZ /d y /f >/dev/null 2>&1 || true
+  bwineserver "$b" -w
+  log "Bottle ready: $dir"
+}
+
+bottle_delete() {
+  local b="${1:-}" dir; dir=$(bottle_dir "$b")
+  [ -d "$dir" ] || die "bottle '$b' does not exist"
+  bwineserver "$b" -k 2>/dev/null || true
+  rm -rf "$dir"
+  log "Deleted bottle '$b'"
+}
+
+bottle_list() {
+  local d
+  for d in "$BOTTLES"/*/; do
+    [ -d "$d" ] || { echo "(none)"; return; }
+    printf '%-16s %s\n' "$(basename "$d")" "$(sed -n 's/^RUNTIME=//p' "$d/cellar.conf" 2>/dev/null)"
+  done
+}
+
+# --- steam ------------------------------------------------------------------
+
+steam_exe() {
+  local dir; dir=$(bottle_dir "$1")
+  for p in "Program Files (x86)/Steam/steam.exe" "Program Files/Steam/steam.exe"; do
+    [ -f "$dir/drive_c/$p" ] && { echo "$dir/drive_c/$p"; return; }
+  done
+  return 1
+}
+
+steam_install() {
+  local b="${1:-}" dir; dir=$(bottle_dir "$b")
+  bottle_runtime "$b" >/dev/null
+  mkdir -p "$CACHE"
+  log "Downloading SteamSetup.exe"
+  curl -fL --progress-bar -o "$CACHE/SteamSetup.exe" "$STEAM_SETUP_URL"
+  log "Installing Steam into '$b' (silent)"
+  bwine "$b" "$CACHE/SteamSetup.exe" /S >"$dir/logs/steam-install.log" 2>&1 || true
+  bwineserver "$b" -w
+  steam_exe "$b" >/dev/null || die "Steam install failed; see $dir/logs/steam-install.log"
+  log "Steam installed. Launch it with: cellar steam run $b"
+}
+
+steam_run() {
+  local b="${1:-}" fg=0 dir exe; shift || true
+  dir=$(bottle_dir "$b")
+  exe=$(steam_exe "$b") || die "Steam is not installed in '$b'; run: cellar steam install $b"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fg)  fg=1; shift ;;
+      --hud) export MTL_HUD_ENABLED=1; shift ;;
+      *) break ;;
+    esac
+  done
+  # shellcheck disable=SC2086
+  if [ $fg = 1 ]; then
+    bwine "$b" "$exe" $STEAM_ARGS "$@"
+  else
+    nohup "$0" run "$b" "$exe" $STEAM_ARGS "$@" >"$dir/logs/steam.log" 2>&1 &
+    log "Steam starting (pid $!). Log: $dir/logs/steam.log"
+  fi
+}
+
+# --- status -----------------------------------------------------------------
+
+# A bottle is running while its wineserver holds the lock in Wine's per-prefix server dir
+# (/tmp/.wine-<uid>/server-<dev>-<inode>, from the bottle directory's stat).
+bottle_running() {
+  local dir s
+  dir=$(bottle_dir "$1")
+  [ -d "$dir" ] || return 1
+  s="/tmp/.wine-$(id -u)/server-$(printf %x "$(stat -f %d "$dir")")-$(printf %x "$(stat -f %i "$dir")")"
+  [ -S "$s/socket" ] && lsof -t "$s/lock" >/dev/null 2>&1
+}
+
+# Tab-separated: name, runtime, running|stopped, steam|-. Read by Cellar.app.
+status() {
+  local d b state steam
+  for d in "$BOTTLES"/*/; do
+    [ -f "$d/cellar.conf" ] || continue
+    b=$(basename "$d")
+    if bottle_running "$b"; then state=running; else state=stopped; fi
+    if steam_exe "$b" >/dev/null; then steam=steam; else steam=-; fi
+    printf '%s\t%s\t%s\t%s\n' "$b" "$(sed -n 's/^RUNTIME=//p' "$d/cellar.conf")" "$state" "$steam"
+  done
+}
+
+# --- doctor -----------------------------------------------------------------
+
+doctor() {
+  local ok=1
+  printf 'macOS        %s (%s)\n' "$(sw_vers -productVersion)" "$(uname -m)"
+  if [ "$(uname -m)" = arm64 ]; then
+    if /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then echo "Rosetta 2    installed"
+    else echo "Rosetta 2    MISSING — run: softwareupdate --install-rosetta --agree-to-license"; ok=0; fi
+  fi
+  if [ -d /Library/Frameworks/GStreamer.framework ]; then echo "GStreamer    installed"
+  else echo "GStreamer    missing (optional: needed for in-game video/audio cutscenes)"; fi
+  echo "Runtimes:"; runtime_list | sed 's/^/  /'
+  echo "Bottles:";  bottle_list  | sed 's/^/  /'
+  [ $ok = 1 ]
+}
+
+# --- main -------------------------------------------------------------------
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  doctor) doctor ;;
+  status) status ;;
+  runtime)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      list) runtime_list ;;
+      install) runtime_install "$@" ;;
+      link) runtime_link "$@" ;;
+      d3dmetal) runtime_d3dmetal "$@" ;;
+      *) usage; exit 1 ;;
+    esac ;;
+  bottle)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      list) bottle_list ;;
+      create) bottle_create "$@" ;;
+      delete) bottle_delete "$@" ;;
+      *) usage; exit 1 ;;
+    esac ;;
+  steam)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      install) steam_install "$@" ;;
+      run) steam_run "$@" ;;
+      *) usage; exit 1 ;;
+    esac ;;
+  run)  b="${1:-}"; shift || true; [ $# -gt 0 ] || die "usage: cellar run <bottle> <program> [args]"; bwine "$b" "$@" ;;
+  kill) bwineserver "${1:-}" -k; log "Stopped '${1:-}'" ;;
+  open) open "$(bottle_dir "${1:-}")/drive_c" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

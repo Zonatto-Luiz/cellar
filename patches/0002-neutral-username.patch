@@ -1,0 +1,57 @@
+--- a/dlls/advapi32/advapi.c
++++ b/dlls/advapi32/advapi.c
+@@ -51,8 +51,8 @@
+     /* CrossOver Hack 12735: Use a consistent username */
+     if (!getenv( "CX_REPORT_REAL_USERNAME" ))
+     {
+-        len = sizeof("crossover");
+-        if ((ret = (len <= *size))) strcpy( name, "crossover" );
++        len = sizeof("cellar");
++        if ((ret = (len <= *size))) strcpy( name, "cellar" );
+         else SetLastError( ERROR_INSUFFICIENT_BUFFER );
+         *size = len;
+         return ret;
+@@ -76,8 +76,8 @@
+     /* CrossOver Hack 12735: Use a consistent username */
+     if (!getenv( "CX_REPORT_REAL_USERNAME" ))
+     {
+-        len = ARRAY_SIZE( L"crossover" );
+-        if ((ret = (len <= *size))) wcscpy( name, L"crossover" );
++        len = ARRAY_SIZE( L"cellar" );
++        if ((ret = (len <= *size))) wcscpy( name, L"cellar" );
+         else SetLastError( ERROR_INSUFFICIENT_BUFFER );
+         *size = len;
+         return ret;
+--- a/dlls/shell32/shellpath.c
++++ b/dlls/shell32/shellpath.c
+@@ -2633,7 +2633,7 @@
+         else if (!wcsnicmp(szTemp, L"%USERPROFILE%", lstrlenW(L"%USERPROFILE%")))
+         {
+             /* CrossOver Hack 12735 */
+-            static const WCHAR userName[] = {'c','r','o','s','s','o','v','e','r',0};
++            static const WCHAR userName[] = L"cellar";
+ 
+             lstrcpyW(szDest, szProfilesPrefix);
+             PathAppendW(szDest, userName);
+--- a/programs/iexplore/iexplore.inf
++++ b/programs/iexplore/iexplore.inf
+@@ -40,7 +40,7 @@
+ HKLM,"Software\Microsoft\Internet Explorer","Version",,"9.11.9600.18376"
+ HKLM,"Software\Microsoft\Internet Explorer","W2kVersion",,"9.11.9600.18376"
+ HKLM,"Software\Microsoft\Internet Explorer","svcVersion",,"11.0.9600.18376"
+-HKLM,"Software\Microsoft\Windows\CurrentVersion\Uninstall\CXHTML","DisplayName",,"CrossOver HTML engine"
++HKLM,"Software\Microsoft\Windows\CurrentVersion\Uninstall\CXHTML","DisplayName",,"Wine HTML engine"
+ HKLM,"Software\Microsoft\Windows\CurrentVersion\Uninstall\CXHTML","UninstallString",,"iexplore -unregserver"
+ 
+ 
+--- a/dlls/ieframe/iexplore.c
++++ b/dlls/ieframe/iexplore.c
+@@ -51,7 +51,7 @@
+ 
+ /* Windows uses "Microsoft Internet Explorer" */
+ /* CrossOver: We use "CrossOver Web Browser" */
+-static const WCHAR wszWineInternetExplorer[] = L"CrossOver Web Browser";
++static const WCHAR wszWineInternetExplorer[] = L"Wine Web Browser";
+ 
+ static LONG obj_cnt;
+ static DWORD dde_inst;
