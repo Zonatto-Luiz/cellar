@@ -70,6 +70,12 @@ The D3DMetal `d3d10/d3d11/d3d12/dxgi.so` files must stay symlinks to
   benefit but uses `cellar`, and renames the built-in "CrossOver" browser entries to "Wine".
   Bottles created before this patch need their `drive_c/users/crossover` folder and registry
   paths renamed, or Steam has to be signed in again.
+- `0003-macos-gs-last-error.patch` — Windows code may read the last error straight from
+  `%gs:0x68` (TEB.LastErrorValue); Mono's x64 JIT does after every P/Invoke. On macOS `%gs`
+  points at the pthread TSD array, where 0x68 is libc's `gmtime()` slot, so Unity games saw
+  error 0: `File.Exists` reported missing files as present and Core Keeper never saved
+  (`Write failed: Success`). The syscall and unix-call dispatchers now swap that slot at every
+  PE/Unix transition, and `SetLastError` also stores to `%gs:0x68`.
 
 ## Command line
 

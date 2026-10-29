@@ -1,0 +1,163 @@
+--- a/include/winbase.h
++++ b/include/winbase.h
+@@ -2701,6 +2701,10 @@
+ static FORCEINLINE void WINAPI SetLastError( DWORD err )
+ {
+     *(DWORD *)((void **)NtCurrentTeb() + 13) = err;
++#if defined(__x86_64__) && !defined(__arm64ec__) && !defined(WINE_UNIX_LIB)
++    /* On macOS %gs isn't the TEB; keep %gs:0x68 in step for code that reads the error there. */
++    __asm__ volatile( "movl %0,%%gs:0x68" :: "r" (err) : "memory" );
++#endif
+ }
+ 
+ #else  /* __WINESRC__ */
+--- a/dlls/ntdll/error.c
++++ b/dlls/ntdll/error.c
+@@ -122,6 +122,10 @@
+ void WINAPI RtlSetLastWin32Error( DWORD err )
+ {
+     NtCurrentTeb()->LastErrorValue = err;
++#if defined(__x86_64__) && !defined(__arm64ec__)
++    /* On macOS %gs isn't the TEB; keep %gs:0x68 in step for code that reads the error there. */
++    __asm__ volatile( "movl %0,%%gs:0x68" :: "r" (err) : "memory" );
++#endif
+ }
+ 
+ /***********************************************************************
+@@ -137,5 +141,5 @@
+  */
+ void WINAPI RtlSetLastWin32ErrorAndNtStatusFromNtStatus( NTSTATUS status )
+ {
+-    NtCurrentTeb()->LastErrorValue = RtlNtStatusToDosError( status );
++    RtlSetLastWin32Error( RtlNtStatusToDosError( status ) );
+ }
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -508,6 +508,8 @@
+     void                **instrumentation_callback; /* 0330 */
+     DWORD                 fs;            /* 0338 WOW TEB selector */
+     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
++    ULONG_PTR             mac_gs_68;     /* 0340 libc's %gs:0x68 TSD slot while PE code runs */
++    DWORD                 mac_gs_68_pe;  /* 0348 %gs:0x68 holds LastErrorValue */
+ };
+ 
+ C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+@@ -516,7 +518,34 @@
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, instrumentation_callback ) == 0x330 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mac_gs_68 ) == 0x340 );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mac_gs_68_pe ) == 0x348 );
+ 
++/* On macOS %gs points at the pthread TSD array, not the TEB, so %gs:0x68 is libc's gmtime() slot
++ * (__PTK_LIBC_GMTIME_KEY) instead of TEB.LastErrorValue. Some PE code reads the last error straight
++ * from %gs:0x68 (Mono's x64 JIT does after every P/Invoke), so swap the slot at each PE/Unix
++ * transition: PE code sees LastErrorValue, Unix code sees libc's pointer. %r13 must hold the TEB. */
++#ifdef __APPLE__
++#define MAC_GS_68_TO_UNIX(reg) \
++    "cmpl $0,0x348(%r13)\n\t"          /* amd64_thread_data()->mac_gs_68_pe */ \
++    "je 8f\n\t" \
++    "movq 0x340(%r13)," reg "\n\t"    /* amd64_thread_data()->mac_gs_68 */ \
++    "movq " reg ",%gs:0x68\n\t" \
++    "movl $0,0x348(%r13)\n" \
++    "8:\n\t"
++#define MAC_GS_68_TO_PE(reg, reg32) \
++    "cmpl $0,0x348(%r13)\n\t"          /* amd64_thread_data()->mac_gs_68_pe */ \
++    "jne 8f\n\t" \
++    "movq %gs:0x68," reg "\n\t" \
++    "movq " reg ",0x340(%r13)\n\t"    /* amd64_thread_data()->mac_gs_68 */ \
++    "movl $1,0x348(%r13)\n" \
++    "8:\tmovl 0x68(%r13)," reg32 "\n\t" /* teb->LastErrorValue */ \
++    "movq " reg ",%gs:0x68\n\t"
++#else
++#define MAC_GS_68_TO_UNIX(reg)
++#define MAC_GS_68_TO_PE(reg, reg32)
++#endif
++
+ static inline struct amd64_thread_data *amd64_thread_data(void)
+ {
+     return (struct amd64_thread_data *)ntdll_get_thread_data()->cpu_data;
+@@ -1819,6 +1848,7 @@
+                    "movw %ax,%fs\n"
+                    "1:\n\t"
+ #endif
++                   MAC_GS_68_TO_PE("%r11", "%r11d")
+                    "movq 0x330(%r13),%r10\n\t" /* amd64_thread_data()->instrumentation_callback */
+                    "movq (%r10),%r10\n\t"
+                    "test %r10,%r10\n\t"
+@@ -2947,6 +2977,21 @@
+ }
+ 
+ #ifdef __APPLE__
++/**********************************************************************
++ *		mac_restore_gs_68
++ *
++ * Give libc back its gmtime() slot at %gs:0x68 if PE code had it, or MacOS
++ * would free() our last error value when the thread exits.
++ */
++void mac_restore_gs_68(void)
++{
++    struct amd64_thread_data *thread_data = amd64_thread_data();
++
++    if (!thread_data->mac_gs_68_pe) return;
++    __asm__ volatile ("movq %0,%%gs:0x68" :: "r" (thread_data->mac_gs_68));
++    thread_data->mac_gs_68_pe = 0;
++}
++
+ /**********************************************************************
+  *		mac_thread_gsbase
+  */
+@@ -3227,6 +3272,7 @@
+                    __ASM_CFI_REG_IS_AT2(rbp, rcx, 0x98, 0x01)
+                    "movq %gs:0x30,%r13\n\t"        /* teb */
+                    "movl %eax,0xb0(%rcx)\n\t"      /* frame->syscall_id */
++                   MAC_GS_68_TO_UNIX("%rax")
+                    /* Legends of Runeterra hooks the first system call return instruction, and
+                     * depends on us returning to it. Adjust the return address accordingly. */
+                    "subq $0xb,0x70(%rcx)\n\t"
+@@ -3342,6 +3388,7 @@
+                    "movw %dx,%fs\n"
+                    "1:\n\t"
+ #endif
++                   MAC_GS_68_TO_PE("%rdx", "%edx")
+                    "movl 0xb4(%rcx),%edx\n\t"      /* frame->restore_flags */
+                    "testl $0x48,%edx\n\t"          /* CONTEXT_FLOATING_POINT | CONTEXT_XSTATE */
+                    "jnz 2f\n\t"
+@@ -3546,6 +3593,7 @@
+                    "movq %rbp,0x98(%rcx)\n\t"
+                    __ASM_CFI_REG_IS_AT2(rbp, rcx, 0x98, 0x01)
+                    "movq %gs:0x30,%r13\n\t"
++                   MAC_GS_68_TO_UNIX("%rax")
+                    "stmxcsr 0xd8(%rcx)\n\t"        /* frame->xsave.MxCsr */
+                    "movdqa %xmm6,0x1c0(%rcx)\n\t"
+                    "movdqa %xmm7,0x1d0(%rcx)\n\t"
+@@ -3601,6 +3649,7 @@
+                    "movdqa 0x250(%rcx),%xmm15\n\t"
+                    "testl $0xffff,0xb4(%rcx)\n\t"  /* frame->restore_flags */
+                    "jnz " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
++                   MAC_GS_68_TO_PE("%rdx", "%edx")
+                    /* switch to user stack */
+                    "movq 0x88(%rcx),%rsp\n\t"
+                    __ASM_CFI(".cfi_restore_state\n\t")
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1117,6 +1117,7 @@
+     __asm__ volatile (".byte 0x65\n\tmovq %q0,%c1"
+                       :
+                       : "r" (NULL), "n" (FIELD_OFFSET(TEB, Peb)));
++    mac_restore_gs_68();
+ #endif
+ 
+     pthread_exit( UIntToPtr(status) );
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -323,6 +323,9 @@
+ extern BOOL get_thread_times( int unix_pid, int unix_tid, LARGE_INTEGER *kernel_time,
+                               LARGE_INTEGER *user_time );
+ extern void signal_init_threading(void);
++#if defined(__APPLE__) && defined(__x86_64__)
++extern void mac_restore_gs_68(void);
++#endif
+ extern NTSTATUS signal_alloc_thread( TEB *teb );
+ extern void signal_free_thread( TEB *teb );
+ extern void signal_init_process(void);
